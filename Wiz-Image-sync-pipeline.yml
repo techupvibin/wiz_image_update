@@ -1,0 +1,182 @@
+# ---------------------------------------------------------------
+# Wiz image sync pipeline (separate project: wiz-image-sync)
+#
+# Runs on a daily schedule:
+#   detect -> mirror-nexus -> sync-ecr -> open-mr
+#
+# detect     : compares latest Wiz chart versions with versions.env
+#              in the DEPLOY repo. If nothing is new (or an upgrade
+#              MR is already open), later jobs exit early.
+# mirror-nexus: copies charts + images from upstream into Nexus.
+# sync-ecr   : copies images from Nexus into ECR, updates SSM.
+# open-mr    : opens an MR in the deploy repo bumping versions.env.
+#              Merging it triggers the deploy pipeline.
+#
+# Required CI/CD variables (masked/protected):
+#   DEPLOY_REPO_TOKEN   project access token on the deploy repo (write_repository)
+#   NEXUS_USER, NEXUS_PASSWORD
+#   AWS credentials via the runner's IAM role (preferred) or AWS_* variables
+# ---------------------------------------------------------------
+stages:
+  - detect
+  - mirror-nexus
+  - sync-ecr
+  - open-mr
+
+variables:
+  # Network (replace with real values)
+  HTTPS_PROXY: "http://<barclays-proxy>:<port>"
+  NO_PROXY: "<gitlab-host>,<nexus-host>"
+
+  # Sources and targets
+  WIZ_REPO: "https://wiz-sec.github.io/charts"
+  NEXUS_REGISTRY: "<nexus-host>"                    # Docker registry host in Nexus
+  NEXUS_CHART_REPO: "oci://<nexus-host>/wiz-charts" # must match HELM_REPO in the deploy pipeline
+  AWS_REGION: "eu-west-1"
+  ECR_REGISTRY: "<account-id>.dkr.ecr.eu-west-1.amazonaws.com"
+  SSM_PREFIX: "/wiz"                                # e.g. /wiz/outpost-lite/chart-version
+
+  # Deploy repo that holds versions.env
+  DEPLOY_REPO_PATH: "<group>/wiz-deploy"
+
+  OL_CHART: "wiz-outpost-lite"
+  BR_CHART: "wiz-broker"
+
+default:
+  # Tools image mirrored in Nexus with: helm, skopeo, aws cli, git
+  image: <nexus-host>/wiz-sync-tools:latest
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'           # allow a manual "Run pipeline" too
+
+# Reusable guard: later jobs stop early when detect found nothing new
+.skip_if_nothing_new: &skip_if_nothing_new |
+  if [ "$NEW_VERSION" != "true" ]; then
+    echo "No new Wiz version - skipping."
+    exit 0
+  fi
+
+# ---------- 1. Detect ----------
+detect:
+  stage: detect
+  script:
+    # Current versions: read from the deploy repo (source of truth)
+    - git clone --depth 1 "https://oauth2:${DEPLOY_REPO_TOKEN}@${CI_SERVER_HOST}/${DEPLOY_REPO_PATH}.git" deploy
+    - source deploy/versions.env
+    - echo "Deployed -> Outpost Lite $OUTPOST_LITE_CHART | Broker $BROKER_CHART"
+
+    # Latest versions upstream
+    - helm repo add wiz-sec "$WIZ_REPO" && helm repo update
+    - LATEST_OL=$(helm show chart wiz-sec/$OL_CHART | awk '/^version:/{print $2}')
+    - LATEST_BR=$(helm show chart wiz-sec/$BR_CHART | awk '/^version:/{print $2}')
+    - echo "Latest   -> Outpost Lite $LATEST_OL | Broker $LATEST_BR"
+
+    - BRANCH="wiz-upgrade-ol-${LATEST_OL}-br-${LATEST_BR}"
+    - NEW_VERSION=false
+    - |
+      if [ "$LATEST_OL" != "$OUTPOST_LITE_CHART" ] || [ "$LATEST_BR" != "$BROKER_CHART" ]; then
+        if git -C deploy ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+          echo "Upgrade MR branch $BRANCH already exists - nothing to do."
+        else
+          NEW_VERSION=true
+        fi
+      fi
+    - echo "NEW_VERSION=$NEW_VERSION"
+
+    # Pass results to later jobs
+    - |
+      cat > detect.env << ENV
+      NEW_VERSION=$NEW_VERSION
+      LATEST_OL=$LATEST_OL
+      LATEST_BR=$LATEST_BR
+      BRANCH=$BRANCH
+      ENV
+
+    # List the images each chart uses (adjust -f if a chart needs required values to render)
+    - |
+      : > images.txt
+      if [ "$NEW_VERSION" = "true" ]; then
+        for c in "$OL_CHART:$LATEST_OL" "$BR_CHART:$LATEST_BR"; do
+          helm template x "wiz-sec/${c%%:*}" --version "${c##*:}" \
+            | awk '/image:/{print $2}' | tr -d '"' >> images.txt
+        done
+        sort -u -o images.txt images.txt
+        echo "Images to mirror:"; cat images.txt
+      fi
+  artifacts:
+    reports:
+      dotenv: detect.env
+    paths: [images.txt]
+    expire_in: 1 week
+
+# ---------- 2. Mirror to Nexus ----------
+mirror-nexus:
+  stage: mirror-nexus
+  needs: [detect]
+  script:
+    - *skip_if_nothing_new
+    # Charts
+    - helm repo add wiz-sec "$WIZ_REPO" && helm repo update
+    - echo "$NEXUS_PASSWORD" | helm registry login "$NEXUS_REGISTRY" -u "$NEXUS_USER" --password-stdin
+    - helm pull "wiz-sec/$OL_CHART" --version "$LATEST_OL"
+    - helm pull "wiz-sec/$BR_CHART" --version "$LATEST_BR"
+    - helm push "$OL_CHART-$LATEST_OL.tgz" "$NEXUS_CHART_REPO"
+    - helm push "$BR_CHART-$LATEST_BR.tgz" "$NEXUS_CHART_REPO"
+    # Images: upstream -> Nexus (keeps the image path after the registry host)
+    - |
+      while read -r img; do
+        [ -z "$img" ] && continue
+        path="${img#*/}"
+        echo "Mirroring $img -> $NEXUS_REGISTRY/$path"
+        skopeo copy --all \
+          --dest-creds "$NEXUS_USER:$NEXUS_PASSWORD" \
+          "docker://$img" "docker://$NEXUS_REGISTRY/$path"
+      done < images.txt
+
+# ---------- 3. Sync to ECR + SSM ----------
+sync-ecr:
+  stage: sync-ecr
+  needs: [detect, mirror-nexus]
+  variables:
+    NO_PROXY: "<gitlab-host>,<nexus-host>,.amazonaws.com"   # if ECR/SSM go via VPC endpoints
+  script:
+    - *skip_if_nothing_new
+    - ECR_PASS=$(aws ecr get-login-password --region "$AWS_REGION")
+    - |
+      while read -r img; do
+        [ -z "$img" ] && continue
+        path="${img#*/}"
+        repo="${path%%:*}"
+        aws ecr describe-repositories --repository-names "$repo" --region "$AWS_REGION" >/dev/null 2>&1 \
+          || aws ecr create-repository --repository-name "$repo" --region "$AWS_REGION" >/dev/null
+        echo "Syncing $NEXUS_REGISTRY/$path -> $ECR_REGISTRY/$path"
+        skopeo copy --all \
+          --src-creds "$NEXUS_USER:$NEXUS_PASSWORD" \
+          --dest-creds "AWS:$ECR_PASS" \
+          "docker://$NEXUS_REGISTRY/$path" "docker://$ECR_REGISTRY/$path"
+      done < images.txt
+    # Record the mirrored versions in SSM
+    - aws ssm put-parameter --region "$AWS_REGION" --overwrite --type String --name "$SSM_PREFIX/outpost-lite/chart-version" --value "$LATEST_OL"
+    - aws ssm put-parameter --region "$AWS_REGION" --overwrite --type String --name "$SSM_PREFIX/broker/chart-version" --value "$LATEST_BR"
+
+# ---------- 4. Open MR in the deploy repo ----------
+open-mr:
+  stage: open-mr
+  needs: [detect, sync-ecr]
+  script:
+    - *skip_if_nothing_new
+    - git clone --depth 1 "https://oauth2:${DEPLOY_REPO_TOKEN}@${CI_SERVER_HOST}/${DEPLOY_REPO_PATH}.git" deploy
+    - cd deploy
+    - git config user.email "wiz-bot@barclays.com" && git config user.name "wiz-upgrade-bot"
+    - git checkout -b "$BRANCH"
+    - sed -i "s/^OUTPOST_LITE_CHART=.*/OUTPOST_LITE_CHART=${LATEST_OL}/" versions.env
+    - sed -i "s/^BROKER_CHART=.*/BROKER_CHART=${LATEST_BR}/" versions.env
+    - git commit -am "Wiz upgrade: Outpost Lite ${LATEST_OL}, Broker ${LATEST_BR}"
+    - >
+      git push origin "$BRANCH"
+      -o merge_request.create
+      -o merge_request.target=main
+      -o merge_request.title="Wiz upgrade: Outpost Lite ${LATEST_OL}, Broker ${LATEST_BR}"
+      -o merge_request.description="Images and charts mirrored to Nexus and ECR by ${CI_PIPELINE_URL}"

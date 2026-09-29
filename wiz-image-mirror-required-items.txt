@@ -1,0 +1,63 @@
+wiz-image-mirror pipeline: unknowns
+
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| Required Item (as in the pipeline)        | What it is                                 | Why it's needed                                      |
++==================================+============================================+======================================================+
+| HTTPS_PROXY                      | Barclays outbound proxy host and port      | Runners can't reach the internet directly. Needed to |
+|                                  |                                            | reach wiz-sec.github.io and Wiz's image registry     |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| NO_PROXY                         | Hosts that bypass the proxy                | Internal hosts fail or get blocked if sent through   |
+|                                  | (<gitlab-host>, <nexus-host>)              | the internet proxy                                   |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| NEXUS_REGISTRY                   | Nexus Docker registry hostname             | Where images are pushed in the mirror step and       |
+|                                  |                                            | pulled from for the ECR sync                         |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| NEXUS_CHART_REPO                 | Nexus Helm chart repo URL (OCI or classic) | Where charts are pushed. Must match HELM_REPO in the |
+|                                  |                                            | deploy pipeline                                      |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| AWS_REGION                       | AWS region of ECR and SSM (eu-west-1)      | ECR login, repository checks and SSM writes are      |
+|                                  |                                            | region-specific                                      |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| ECR_REGISTRY                     | ECR registry address                       | The target that EKS pulls images from                |
+|                                  | (<account-id>.dkr.ecr...)                  |                                                      |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| SSM_PREFIX                       | Path prefix for the SSM parameters         | Keeps the pipeline consistent with the parameters    |
+|                                  |                                            | the current process uses                             |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| DEPLOY_REPO_PATH                 | Group and path of the wiz-eks-deploy repo  | The pipeline reads versions.env from this repo and   |
+|                                  |                                            | opens the MR there                                   |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| OL_CHART                         | Outpost Lite chart name in the Wiz repo    | Used to look up the latest version and pull the      |
+|                                  |                                            | chart                                                |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| BR_CHART                         | Broker chart name in the Wiz repo          | Same, for the Broker                                 |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| image (wiz-sync-tools)           | CI image with helm, skopeo, aws and git    | Every job needs these tools, and the image must come |
+|                                  |                                            | from Nexus                                           |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| NO_PROXY in sync-ecr             | Adds .amazonaws.com                        | Needed only if ECR and SSM are reached through VPC   |
+|                                  |                                            | endpoints instead of the proxy                       |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| $SSM_PREFIX/outpost-lite/chart-v | SSM parameter name for the Outpost Lite    | Must match the name the current process or other     |
+| ersion                           | version                                    | tooling reads                                        |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| $SSM_PREFIX/broker/chart-version | SSM parameter name for the Broker version  | Same, for the Broker                                 |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| merge_request.target=main        | Default branch of the deploy repo          | The MR must target the branch that triggers the      |
+|                                  |                                            | deploy pipeline                                      |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| user.email / user.name           | Bot identity for commits                   | Commits need an author, and Barclays may require an  |
+|                                  |                                            | approved identity                                    |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| helm template values (-f)        | Dummy values file, if the charts require   | Some charts won't render without required values,    |
+|                                  | one                                        | and rendering is how the image list is built         |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| DEPLOY_REPO_TOKEN                | Project access token on the deploy repo    | Lets the pipeline clone the deploy repo, push the    |
+|                                  | (write_repository)                         | branch and open the MR                               |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| NEXUS_USER / NEXUS_PASSWORD      | Nexus service account                      | Needed to push charts and images to Nexus and pull   |
+|                                  |                                            | images for the ECR sync                              |
++----------------------------------+--------------------------------------------+------------------------------------------------------+
+| AWS credentials (runner IAM      | Role used by the GitLab runner             | Needs ECR push and create-repository, plus SSM       |
+| role)                            |                                            | PutParameter                                         |
++----------------------------------+--------------------------------------------+------------------------------------------------------+

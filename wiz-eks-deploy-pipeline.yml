@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------
+# Wiz Outpost Lite + Broker: automated PoC -> Prod promotion
+#
+# Flow (runs when the version-bump MR is merged to the default branch):
+#   deploy-poc -> validate-poc -> deploy-prod (MANUAL) -> validate-prod
+#   PoC is automatic; prod needs a manual trigger. Prod failures auto-rollback.
+#
+# Required CI/CD variables (masked/protected):
+#   KUBECONFIG_POC, KUBECONFIG_PROD  (type: File)
+# ---------------------------------------------------------------
+stages:
+  - deploy-poc
+  - validate-poc
+  - deploy-prod
+  - validate-prod
+
+variables:
+  HELM_REPO: "oci://<nexus-host>/wiz-charts"      # or ECR, wherever charts are mirrored
+  OL_RELEASE: "outpost-lite-vcs"
+  OL_NAMESPACE: "outpost-lite"
+  BR_RELEASE: "<broker-release>"
+  BR_NAMESPACE: "wiz"
+  MIN_READY_PERCENT: "90"                         # % of scanner pods that must be Ready
+
+default:
+  image: <nexus-host>/alpine/k8s:1.30.4            # has helm + kubectl, mirrored in Nexus
+  before_script:
+    - source versions.env                          # OUTPOST_LITE_CHART, BROKER_CHART
+
+.only_main: &only_main
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: [versions.env]
+
+# ---------- reusable scripts ----------
+.deploy: &deploy |
+  helm upgrade --install "$BR_RELEASE" "$HELM_REPO/wiz-broker" \
+    --version "$BROKER_CHART" -n "$BR_NAMESPACE" \
+    -f values/$ENV/broker.yaml --atomic --wait --timeout 15m
+  helm upgrade --install "$OL_RELEASE" "$HELM_REPO/wiz-outpost-lite" \
+    --version "$OUTPOST_LITE_CHART" -n "$OL_NAMESPACE" \
+    -f values/$ENV/outpost-lite.yaml --atomic --wait --timeout 30m
+
+.validate: &validate |
+  set -e
+  for ns in "$BR_NAMESPACE" "$OL_NAMESPACE"; do
+    for d in $(kubectl get deploy -n "$ns" -o name); do
+      kubectl rollout status "$d" -n "$ns" --timeout=10m
+    done
+  done
+  TOTAL=$(kubectl get pods -n "$OL_NAMESPACE" --no-headers | wc -l)
+  READY=$(kubectl get pods -n "$OL_NAMESPACE" --no-headers | awk '$2 ~ /^([0-9]+)\/\1$/' | wc -l)
+  echo "Outpost Lite ready: $READY/$TOTAL"
+  [ $(( READY * 100 / TOTAL )) -ge "$MIN_READY_PERCENT" ] || { echo "Too few ready pods"; exit 1; }
+  ERRORS=$(kubectl logs -n "$BR_NAMESPACE" -l app.kubernetes.io/instance="$BR_RELEASE" --since=15m | grep -ciE "error|failed to connect" || true)
+  echo "Broker errors in last 15m: $ERRORS"
+  [ "$ERRORS" -eq 0 ] || { echo "Broker tunnel errors"; exit 1; }
+  # Optional: query the Wiz API to confirm recent scans completed successfully.
+
+# ---------- PoC ----------
+deploy-poc:
+  stage: deploy-poc
+  <<: *only_main
+  variables: { ENV: poc, KUBECONFIG: $KUBECONFIG_POC }
+  script: [*deploy]
+
+validate-poc:
+  stage: validate-poc
+  <<: *only_main
+  variables: { KUBECONFIG: $KUBECONFIG_POC }
+  script: [*validate]
+
+# ---------- Prod (manual, after PoC passes) ----------
+deploy-prod:
+  stage: deploy-prod
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: [versions.env]
+      when: manual                                 # someone clicks "Run" in GitLab
+      allow_failure: false                         # pipeline waits here; validate-prod won't run until deployed
+  resource_group: prod                             # never two prod deploys at once
+  environment: { name: production }
+  variables: { ENV: prod, KUBECONFIG: $KUBECONFIG_PROD }
+  script: [*deploy]
+
+validate-prod:
+  stage: validate-prod
+  <<: *only_main
+  resource_group: prod
+  variables: { KUBECONFIG: $KUBECONFIG_PROD }
+  script: [*validate]
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        echo "Prod validation failed - rolling back"
+        helm rollback "$OL_RELEASE" 0 -n "$OL_NAMESPACE" --wait
+        helm rollback "$BR_RELEASE" 0 -n "$BR_NAMESPACE" --wait
+      fi
