@@ -20,6 +20,23 @@ Blue and green run side by side in the same EKS cluster, in separate namespaces.
 has its own Wiz Broker, Outpost Lite pods and Wiz connector.
 
 
+Blue handles all real scanning and reports to the prod Wiz project. Green only scans a few
+test repos, through its own connector, into a separate Wiz project so test results never
+appear in prod dashboards.
+Blue Green
+Purpose Live scanning T esting the new version
+Wiz version Current New
+Repos scanned All A few test repos
+Wiz connector and project Prod Separate test ones
+Gets live traffic Y es Never
+Lifetime Permanent Only during testing
+Upgrade flow
+Every new version goes through green first. Blue is only upgraded after green passes and
+the change is approved.
+
+
+
+
 1. New version found. The daily pipeline detects a new Wiz Broker or Outpost Lite
 release and copies the image into Nexus and ECR.
 Page 2 of 5
