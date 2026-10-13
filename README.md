@@ -3,8 +3,7 @@
 
 Wiz Broker & Outpost Lite: Side-by-Side
 V alidation for Upgrades
-Oct 13, 2026 ·
-@Danish
+Oct 13, 2
 Summary
 We test every new Wiz Broker and Outpost Lite version in a separate green environment
 before it touches the live blue environment. Green runs the new Wiz image and scans a
